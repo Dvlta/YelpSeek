@@ -1,6 +1,6 @@
 """
 Stage 1: Process Raw Yelp Data
-Filters Yelp businesses to restaurants in a target city,
+Filters Yelp businesses to restaurants in one or more target cities,
 aggregates top-10 reviews per restaurant, and saves to Parquet.
 """
 
@@ -17,7 +17,7 @@ RESTAURANT_CATEGORIES = {"Restaurants", "Food", "Bars"}
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Process raw Yelp data into restaurant documents.")
-    parser.add_argument("--city", type=str, default="Las Vegas", help="Target city (default: Las Vegas)")
+    parser.add_argument("--city", type=str, nargs="+", default=["Philadelphia"], help="Target city or cities (default: Philadelphia)")
     parser.add_argument("--min-reviews", type=int, default=10, help="Minimum review count (default: 10)")
     parser.add_argument("--min-stars", type=float, default=3.0, help="Minimum star rating (default: 3.0)")
     parser.add_argument("--top-reviews", type=int, default=10, help="Max reviews to aggregate per restaurant (default: 10)")
@@ -34,8 +34,9 @@ def is_restaurant(categories: str) -> bool:
     return bool(cats & RESTAURANT_CATEGORIES)
 
 
-def load_businesses(business_path: str, city: str, min_reviews: int, min_stars: float) -> dict:
+def load_businesses(business_path: str, cities: list[str], min_reviews: int, min_stars: float) -> dict:
     """Load and filter businesses from the business JSON file."""
+    city_set = set(cities)
     businesses = {}
     print(f"Loading businesses from {business_path}...")
     with open(business_path, "r", encoding="utf-8") as f:
@@ -48,7 +49,7 @@ def load_businesses(business_path: str, city: str, min_reviews: int, min_stars: 
             except json.JSONDecodeError:
                 continue
 
-            if biz.get("city") != city:
+            if biz.get("city") not in city_set:
                 continue
             if biz.get("review_count", 0) < min_reviews:
                 continue
@@ -59,7 +60,7 @@ def load_businesses(business_path: str, city: str, min_reviews: int, min_stars: 
 
             businesses[biz["business_id"]] = biz
 
-    print(f"Found {len(businesses):,} restaurants in {city} after filtering.")
+    print(f"Found {len(businesses):,} restaurants across {cities} after filtering.")
     return businesses
 
 
@@ -148,7 +149,7 @@ def main():
     # Stage 1a: filter businesses
     businesses = load_businesses(business_path, args.city, args.min_reviews, args.min_stars)
     if not businesses:
-        raise ValueError(f"No restaurants found for city='{args.city}'. Check your filters or city name.")
+        raise ValueError(f"No restaurants found for cities={args.city}. Check your filters or city names.")
 
     # Stage 1b: collect reviews for filtered businesses
     reviews = load_reviews(review_path, set(businesses.keys()), args.top_reviews)
