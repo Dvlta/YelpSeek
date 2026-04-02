@@ -1,0 +1,39 @@
+# Environment
+.env
+.env.local
+
+# Data (too large for git)
+data/raw/
+data/processed/
+
+# Models (too large for git)
+/models/
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+*.egg-info/
+
+# Node
+frontend/node_modules/
+
+# OS
+.DS_Store
+
+# Claude
+.claude/
+
+# private stuff
+images/
+notes/
+
+# FAISS index and metadata (large, generated files)
+backend/data/
+
+# Vite build output
+frontend/dist/
+
+# Python test cache
+.pytest_cache/
