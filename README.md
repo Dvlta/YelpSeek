@@ -87,6 +87,31 @@ Open [http://localhost:5173](http://localhost:5173).
 
 ---
 
+## Benchmarks
+
+### Retrieval Quality
+Evaluated on a 10% held-out validation set (6,759 query-document pairs) after 3 epochs of fine-tuning on 5,117 Philadelphia restaurants.
+
+| Metric | Score |
+|--------|-------|
+| Recall@1 | 0.389 |
+| Recall@5 | 0.556 |
+| Recall@10 | **0.614** |
+| Recall@50 | 0.733 |
+| MRR | 0.467 |
+| NDCG@10 | 0.497 |
+
+### Query Latency
+Measured end-to-end on a MacBook (CPU inference, FAISS HNSW index).
+
+| Step | Time |
+|------|------|
+| Query encoding | ~80ms |
+| FAISS search (5K docs) | <5ms |
+| Total API response | ~90ms |
+
+---
+
 ## Tech Stack
 
 | Layer | Technology |
