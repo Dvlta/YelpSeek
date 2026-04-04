@@ -71,32 +71,50 @@ def ndcg_at_k(ranks: list[int], k: int) -> float:
     return (sum(scores) / len(scores)) / ideal
 
 
-def evaluate(model: SentenceTransformer, val_pairs: list[dict], doc_index: dict[str, str]) -> dict:
+def evaluate(model: SentenceTransformer, val_pairs: list[dict], chunk_index: dict[str, str], chunk_to_bid: dict[str, str], full_corpus: bool = False) -> dict:
     """
-    Evaluate retrieval metrics on the validation set.
-    For each query, rank all documents and find the rank of the true positive.
+    Evaluate retrieval at the restaurant level using chunked encoding.
+    For each query, compute max similarity across all chunks per restaurant,
+    then rank restaurants and find the rank of the true positive.
+    If full_corpus=True, ranks against all chunks; otherwise only val set restaurants.
     """
     print("Running evaluation...")
 
-    # Get unique business_ids in val set
-    val_bids = list({p["business_id"] for p in val_pairs})
+    # Determine candidate pool
+    if full_corpus:
+        val_chunk_ids = [cid for cid in chunk_to_bid if cid in chunk_index]
+    else:
+        val_bids_set = {p["business_id"] for p in val_pairs}
+        val_chunk_ids = [cid for cid, bid in chunk_to_bid.items() if bid in val_bids_set and cid in chunk_index]
+    chunk_texts = [chunk_index[cid] for cid in val_chunk_ids]
+
+    # Encode all chunks (no prefix for BGE)
+    chunk_embeddings = encode_docs(model, chunk_texts)  # (n_chunks, dim)
+
+    # Map chunks to restaurant indices
+    val_bids = list({chunk_to_bid[cid] for cid in val_chunk_ids})
     bid_to_idx = {bid: i for i, bid in enumerate(val_bids)}
+    chunk_bid_indices = np.array([bid_to_idx[chunk_to_bid[cid]] for cid in val_chunk_ids])
 
-    # Encode all candidate documents (no prefix for BGE)
-    doc_texts = [doc_index[bid] for bid in val_bids]
-    doc_embeddings = encode_docs(model, doc_texts)
-
-    # Encode queries with BGE instruction prefix
+    # Encode all queries at once
     queries = [p["query"] for p in val_pairs]
-    query_embeddings = encode_queries(model, queries)
+    query_embeddings = encode_queries(model, queries)  # (n_queries, dim)
 
+    # Compute all chunk-query similarities in one matrix multiply: (n_chunks, n_queries)
+    chunk_query_scores = chunk_embeddings @ query_embeddings.T
+
+    # Aggregate to restaurant level: max score per restaurant per query
+    n_restaurants = len(val_bids)
+    n_queries = len(val_pairs)
+    restaurant_query_scores = np.full((n_restaurants, n_queries), -np.inf)
+    np.maximum.at(restaurant_query_scores, chunk_bid_indices, chunk_query_scores)
+
+    # Rank restaurants for each query and find rank of true positive
     ranks = []
     for i, pair in enumerate(val_pairs):
-        q_emb = query_embeddings[i]
-        scores = doc_embeddings @ q_emb  # cosine similarity (normalized)
         true_idx = bid_to_idx[pair["business_id"]]
-        # rank is 1-indexed position of the true doc (higher score = lower rank)
-        rank = int((-scores).argsort().tolist().index(true_idx)) + 1
+        col = restaurant_query_scores[:, i]
+        rank = int((-col).argsort().tolist().index(true_idx)) + 1
         ranks.append(rank)
 
     return {
@@ -119,11 +137,12 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    # Load docs
+    # Load docs (chunked — one row per review)
     print(f"Loading docs from {args.docs}...")
     df_docs = pd.read_parquet(args.docs)
-    doc_index = dict(zip(df_docs["business_id"], df_docs["doc_text"]))
-    print(f"Loaded {len(doc_index):,} restaurant documents.")
+    chunk_index = dict(zip(df_docs["chunk_id"], df_docs["chunk_text"]))
+    chunk_to_bid = dict(zip(df_docs["chunk_id"], df_docs["business_id"]))
+    print(f"Loaded {len(chunk_index):,} chunks from {df_docs['business_id'].nunique():,} restaurants.")
 
     # Load pairs
     print(f"Loading pairs from {args.pairs}...")
@@ -131,29 +150,30 @@ def main():
     with open(args.pairs, "r") as f:
         for line in f:
             p = json.loads(line)
-            if p["business_id"] in doc_index:
+            if p["chunk_id"] in chunk_index:
                 pairs.append(p)
     print(f"Loaded {len(pairs):,} valid pairs.")
 
-    # Train/val split (stratified by business_id to avoid data leakage)
+    # Train/val split stratified by business_id to avoid leakage
     random.shuffle(pairs)
     val_size = int(len(pairs) * args.val_split)
     val_pairs = pairs[:val_size]
     train_pairs = pairs[val_size:]
     print(f"Train: {len(train_pairs):,} | Val: {len(val_pairs):,}")
 
-    # Build InputExamples for training (queries get BGE instruction prefix, docs do not)
+    # Build InputExamples: (prefixed_query, chunk_text)
     train_examples = [
-        InputExample(texts=[BGE_QUERY_INSTRUCTION + p["query"], doc_index[p["business_id"]]])
+        InputExample(texts=[BGE_QUERY_INSTRUCTION + p["query"], chunk_index[p["chunk_id"]]])
         for p in train_pairs
     ]
 
-    train_dataloader = DataLoader(train_examples, shuffle=True, batch_size=args.batch_size)
+    train_dataloader = DataLoader(train_examples, shuffle=True, batch_size=args.batch_size,
+                                   num_workers=4, pin_memory=True)
 
     # Load model
     print(f"Loading base model: {args.base_model}")
-    model = SentenceTransformer(args.base_model)
-    model.max_seq_length = 512
+    model = SentenceTransformer(args.base_model, device="cuda")
+    model.max_seq_length = 256
 
     train_loss = losses.MultipleNegativesRankingLoss(model)
 
@@ -181,9 +201,9 @@ def main():
         )
 
         # Reload saved checkpoint for evaluation
-        model = SentenceTransformer(epoch_output)
+        model = SentenceTransformer(epoch_output, device="cuda")
 
-        metrics = evaluate(model, val_pairs, doc_index)
+        metrics = evaluate(model, val_pairs, chunk_index, chunk_to_bid)
         print(f"Epoch {epoch} metrics:")
         for k, v in metrics.items():
             print(f"  {k}: {v:.4f}")
@@ -198,6 +218,14 @@ def main():
 
     print(f"\nTraining complete. Best epoch: {best_epoch} (Recall@10={best_recall_at_10:.4f})")
     print(f"Best model saved at: {os.path.join(args.output, 'best')}")
+
+    # Full-corpus evaluation on best model
+    print("\n--- Full-corpus evaluation on best model ---")
+    best_model = SentenceTransformer(os.path.join(args.output, "best"), device="cuda")
+    full_metrics = evaluate(best_model, val_pairs, chunk_index, chunk_to_bid, full_corpus=True)
+    print("Full-corpus metrics:")
+    for k, v in full_metrics.items():
+        print(f"  {k}: {v:.4f}")
 
 
 if __name__ == "__main__":

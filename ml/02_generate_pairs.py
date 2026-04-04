@@ -1,9 +1,11 @@
 """
 Stage 2: Generate Training Pairs
-Produces (query, business_id) pairs from restaurant documents for dual-encoder training.
+Produces (query, chunk_id) pairs from review chunks for dual-encoder training.
 
-Strategy A (pseudo): Extract first sentence of each review as a pseudo-query.
-Strategy B (synthetic): Use GPT-4o-mini to generate 5 natural queries per restaurant.
+Strategy A (pseudo): Extract first sentence of each review chunk as a pseudo-query,
+                     paired with that specific chunk.
+Strategy B (synthetic): Use GPT to generate 5 queries per restaurant,
+                        paired with all chunks for that restaurant.
 """
 
 import argparse
@@ -30,6 +32,8 @@ def parse_args():
                         help="Max number of restaurants to process (useful for testing)")
     parser.add_argument("--min-pairs", type=int, default=3,
                         help="Minimum pairs per restaurant to include (default: 3)")
+    parser.add_argument("--max-chunks-per-query", type=int, default=5,
+                        help="Max chunks to pair with each synthetic query (default: 5)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for shuffling (default: 42)")
     return parser.parse_args()
@@ -49,18 +53,16 @@ def extract_pseudo_query(review_text: str) -> str | None:
 
 
 def generate_pseudo_pairs(row: pd.Series) -> list[dict]:
-    """Generate pseudo-query pairs from a restaurant's combined reviews."""
-    pairs = []
-    reviews = row["combined_reviews"].split(" | ")
-    for review_text in reviews:
-        query = extract_pseudo_query(review_text)
-        if query:
-            pairs.append({
-                "query": query,
-                "business_id": row["business_id"],
-                "source": "pseudo",
-            })
-    return pairs
+    """Pair each chunk's first sentence with that specific chunk."""
+    query = extract_pseudo_query(row["chunk_text"])
+    if query:
+        return [{
+            "query": query,
+            "chunk_id": row["chunk_id"],
+            "business_id": row["business_id"],
+            "source": "pseudo",
+        }]
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -80,10 +82,11 @@ Reviews: {reviews}
 Return format: ["query 1", "query 2", "query 3", "query 4", "query 5"]"""
 
 
-def generate_synthetic_pairs(row: pd.Series, client) -> list[dict]:
-    """Call GPT-4o-mini to generate 5 queries for a restaurant."""
-    # Truncate reviews to avoid token limits
-    reviews_snippet = row["combined_reviews"][:3000]
+def generate_synthetic_pairs(restaurant_chunks: pd.DataFrame, client, max_chunks: int = 5) -> list[dict]:
+    """Generate 5 queries per restaurant, paired with top-N chunks for that restaurant."""
+    row = restaurant_chunks.iloc[0]  # metadata is same across all chunks
+    chunks_to_pair = restaurant_chunks.head(max_chunks)
+    reviews_snippet = " | ".join(restaurant_chunks["chunk_text"].tolist())[:3000]
     prompt = SYNTHETIC_PROMPT.format(
         name=row["name"],
         categories=row["categories"],
@@ -99,11 +102,18 @@ def generate_synthetic_pairs(row: pd.Series, client) -> list[dict]:
         queries = json.loads(content)
         if not isinstance(queries, list):
             return []
-        return [
-            {"query": q.strip(), "business_id": row["business_id"], "source": "synthetic"}
-            for q in queries
-            if isinstance(q, str) and q.strip()
-        ]
+        pairs = []
+        for q in queries:
+            if isinstance(q, str) and q.strip():
+                # Pair each synthetic query with all chunks of this restaurant
+                for _, chunk_row in chunks_to_pair.iterrows():
+                    pairs.append({
+                        "query": q.strip(),
+                        "chunk_id": chunk_row["chunk_id"],
+                        "business_id": chunk_row["business_id"],
+                        "source": "synthetic",
+                    })
+        return pairs
     except Exception as e:
         print(f"  [warn] Synthetic query failed for {row['name']}: {e}")
         return []
@@ -133,23 +143,30 @@ def main():
 
     print(f"Loading {args.input}...")
     df = pd.read_parquet(args.input)
-    print(f"Loaded {len(df):,} restaurants.")
+    n_restaurants = df["business_id"].nunique()
+    print(f"Loaded {len(df):,} chunks from {n_restaurants:,} restaurants.")
+
+    # Group chunks by restaurant for synthetic strategy
+    grouped = df.groupby("business_id")
+    business_ids = list(grouped.groups.keys())
 
     if args.limit:
-        df = df.head(args.limit)
-        print(f"Limited to {len(df):,} restaurants.")
+        business_ids = business_ids[:args.limit]
+        print(f"Limited to {args.limit:,} restaurants.")
 
     all_pairs: list[dict] = []
     skipped = 0
 
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="Generating pairs"):
+    for bid in tqdm(business_ids, desc="Generating pairs"):
+        chunks = grouped.get_group(bid)
         pairs: list[dict] = []
 
         if args.strategy in ("pseudo", "both"):
-            pairs.extend(generate_pseudo_pairs(row))
+            for _, row in chunks.iterrows():
+                pairs.extend(generate_pseudo_pairs(row))
 
         if args.strategy in ("synthetic", "both"):
-            pairs.extend(generate_synthetic_pairs(row, client))
+            pairs.extend(generate_synthetic_pairs(chunks, client, args.max_chunks_per_query))
 
         if len(pairs) < args.min_pairs:
             skipped += 1
@@ -159,11 +176,11 @@ def main():
 
     print(f"Generated {len(all_pairs):,} pairs ({skipped} restaurants skipped for <{args.min_pairs} pairs).")
 
-    # Deduplicate on (query, business_id)
+    # Deduplicate on (query, chunk_id)
     seen = set()
     deduped = []
     for pair in all_pairs:
-        key = (pair["query"], pair["business_id"])
+        key = (pair["query"], pair["chunk_id"])
         if key not in seen:
             seen.add(key)
             deduped.append(pair)

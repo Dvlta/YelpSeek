@@ -1,7 +1,8 @@
 """
 Stage 1: Process Raw Yelp Data
 Filters Yelp businesses to restaurants in one or more target cities,
-aggregates top-10 reviews per restaurant, and saves to Parquet.
+outputs one row per review chunk (chunked encoding approach).
+Each restaurant produces up to --top-reviews rows, one per review.
 """
 
 import argparse
@@ -20,7 +21,7 @@ def parse_args():
     parser.add_argument("--city", type=str, nargs="+", default=["Philadelphia"], help="Target city or cities (default: Philadelphia)")
     parser.add_argument("--min-reviews", type=int, default=10, help="Minimum review count (default: 10)")
     parser.add_argument("--min-stars", type=float, default=3.0, help="Minimum star rating (default: 3.0)")
-    parser.add_argument("--top-reviews", type=int, default=10, help="Max reviews to aggregate per restaurant (default: 10)")
+    parser.add_argument("--top-reviews", type=int, default=50, help="Max review chunks per restaurant (default: 50)")
     parser.add_argument("--raw-data-dir", type=str, default="data/raw", help="Path to raw Yelp JSON files")
     parser.add_argument("--output", type=str, default="data/processed/restaurant_docs.parquet", help="Output Parquet path")
     return parser.parse_args()
@@ -101,35 +102,32 @@ def load_reviews(review_path: str, business_ids: set, top_k: int) -> dict[str, l
 
 
 def build_documents(businesses: dict, reviews: dict[str, list]) -> list[dict]:
-    """Combine business metadata and aggregated reviews into document records."""
+    """Output one row per review chunk. Each chunk is a single review for a restaurant."""
     docs = []
     for bid, biz in businesses.items():
         review_texts = reviews.get(bid, [])
         if not review_texts:
-            # Skip restaurants with no reviews (shouldn't happen given min_reviews filter,
-            # but reviews file might not perfectly align with business file)
             continue
 
-        combined_reviews = " | ".join(review_texts)
         name = biz.get("name", "")
         categories = biz.get("categories", "")
 
-        doc_text = f"{name}. {categories}. {combined_reviews}"
-
-        docs.append({
-            "business_id": bid,
-            "name": name,
-            "city": biz.get("city", ""),
-            "state": biz.get("state", ""),
-            "stars": biz.get("stars"),
-            "review_count": biz.get("review_count"),
-            "categories": categories,
-            "address": biz.get("address", ""),
-            "latitude": biz.get("latitude"),
-            "longitude": biz.get("longitude"),
-            "combined_reviews": combined_reviews,
-            "doc_text": doc_text,
-        })
+        for i, review_text in enumerate(review_texts):
+            docs.append({
+                "chunk_id": f"{bid}_{i}",
+                "business_id": bid,
+                "chunk_index": i,
+                "chunk_text": review_text,
+                "name": name,
+                "city": biz.get("city", ""),
+                "state": biz.get("state", ""),
+                "stars": biz.get("stars"),
+                "review_count": biz.get("review_count"),
+                "categories": categories,
+                "address": biz.get("address", ""),
+                "latitude": biz.get("latitude"),
+                "longitude": biz.get("longitude"),
+            })
 
     return docs
 
@@ -162,9 +160,9 @@ def main():
     # Stage 1d: save to Parquet
     df = pd.DataFrame(docs)
     df.to_parquet(args.output, index=False)
-    print(f"Saved to {args.output}")
-    print(df[["name", "city", "stars", "review_count"]].describe(include="all").to_string())
-    print(f"\nSample doc_text (first restaurant):\n{df['doc_text'].iloc[0][:500]}...")
+    n_restaurants = df["business_id"].nunique()
+    print(f"Saved {len(df):,} chunks from {n_restaurants:,} restaurants to {args.output}")
+    print(f"\nSample chunk_text:\n{df['chunk_text'].iloc[0][:300]}...")
 
 
 if __name__ == "__main__":

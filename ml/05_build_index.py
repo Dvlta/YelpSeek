@@ -51,16 +51,17 @@ def main():
     print(f"Loading model from {args.model}...")
     model = SentenceTransformer(args.model)
 
-    # Load docs
+    # Load docs (chunked — one row per review)
     print(f"Loading docs from {args.docs}...")
     df = pd.read_parquet(args.docs)
-    print(f"Loaded {len(df):,} restaurants.")
+    n_restaurants = df["business_id"].nunique()
+    print(f"Loaded {len(df):,} chunks from {n_restaurants:,} restaurants.")
 
-    # Encode all documents (no query instruction prefix for documents)
-    print("Encoding documents...")
-    doc_texts = df["doc_text"].tolist()
+    # Encode each chunk individually (no query instruction prefix for documents)
+    print("Encoding chunks...")
+    chunk_texts = df["chunk_text"].tolist()
     embeddings = model.encode(
-        doc_texts,
+        chunk_texts,
         batch_size=args.batch_size,
         show_progress_bar=True,
         normalize_embeddings=True,
@@ -75,15 +76,15 @@ def main():
     index.hnsw.efConstruction = args.ef_construction
     index.hnsw.efSearch = args.ef_search
     index.add(embeddings)
-    print(f"Index built: {index.ntotal:,} restaurants indexed.")
+    print(f"Index built: {index.ntotal:,} chunks indexed ({n_restaurants:,} restaurants).")
 
     # Save index
     faiss.write_index(index, args.index_out)
     print(f"FAISS index saved to {args.index_out}")
 
-    # Save metadata (row order matches FAISS index positions)
-    metadata_cols = ["business_id", "name", "city", "state", "stars", "review_count",
-                     "categories", "address", "latitude", "longitude", "combined_reviews"]
+    # Save metadata — one row per chunk, row i matches FAISS index position i
+    metadata_cols = ["chunk_id", "business_id", "chunk_text", "name", "city", "state",
+                     "stars", "review_count", "categories", "address", "latitude", "longitude"]
     df[metadata_cols].to_parquet(args.metadata_out, index=False)
     print(f"Metadata saved to {args.metadata_out}")
 

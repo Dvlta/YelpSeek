@@ -37,3 +37,6 @@ frontend/dist/
 
 # Python test cache
 .pytest_cache/
+
+# Blob pipeline variants
+*_blob.py
